@@ -24,7 +24,6 @@
 #ifdef CONFIG_SECCOMP_FILTER
 #include <asm/syscall.h>
 #include <linux/filter.h>
-#include <linux/ptrace.h>
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/tracehook.h>
@@ -60,6 +59,18 @@ struct seccomp_filter {
 
 /* Limit any path through the tree to 256KB worth of instructions. */
 #define MAX_INSNS_PER_PATH ((1 << 18) / sizeof(struct sock_filter))
+
+static void seccomp_filter_log_failure(int syscall)
+{
+	int compat = 0;
+#ifdef CONFIG_COMPAT
+	compat = is_compat_task();
+#endif
+	pr_info("%s[%d]: %ssystem call %d blocked at 0x%lx\n",
+		current->comm, task_pid_nr(current),
+		(compat ? "compat " : ""),
+		syscall, KSTK_EIP(current));
+}
 
 /**
  * get_u32 - returns a u32 offset into data
@@ -200,40 +211,19 @@ static int seccomp_check_filter(struct sock_filter *filter, unsigned int flen)
 static u32 seccomp_run_filters(int syscall)
 {
 	struct seccomp_filter *f;
-	u32 ret = SECCOMP_RET_ALLOW;
-
-	/* Ensure unexpected behavior doesn't result in failing open. */
-	if (WARN_ON(current->seccomp.filter == NULL))
-		return SECCOMP_RET_KILL;
-
+	u32 ret = SECCOMP_RET_KILL;
 	/*
 	 * All filters in the list are evaluated and the lowest BPF return
-	 * value always takes priority (ignoring the DATA).
+	 * value always takes priority.
 	 */
 	for (f = current->seccomp.filter; f; f = f->prev) {
-		u32 cur_ret = sk_run_filter(NULL, f->insns);
-		if ((cur_ret & SECCOMP_RET_ACTION) < (ret & SECCOMP_RET_ACTION))
-			ret = cur_ret;
+		ret = sk_run_filter(NULL, f->insns);
+		if (ret != SECCOMP_RET_ALLOW)
+			break;
 	}
 	return ret;
 }
-#endif /* CONFIG_SECCOMP_FILTER */
 
-static inline bool seccomp_may_assign_mode(unsigned long seccomp_mode)
-{
-	if (current->seccomp.mode && current->seccomp.mode != seccomp_mode)
-		return false;
-
-	return true;
-}
-
-static inline void seccomp_assign_mode(unsigned long seccomp_mode)
-{
-	current->seccomp.mode = seccomp_mode;
-	set_tsk_thread_flag(current, TIF_SECCOMP);
-}
-
-#ifdef CONFIG_SECCOMP_FILTER
 /**
  * seccomp_attach_filter: Attaches a seccomp filter to current.
  * @fprog: BPF program to install
@@ -349,26 +339,6 @@ void put_seccomp_filter(struct task_struct *tsk)
 		kfree(freeme);
 	}
 }
-
-/**
- * seccomp_send_sigsys - signals the task to allow in-process syscall emulation
- * @syscall: syscall number to send to userland
- * @reason: filter-supplied reason code to send to userland (via si_errno)
- *
- * Forces a SIGSYS with a code of SYS_SECCOMP and related sigsys info.
- */
-static void seccomp_send_sigsys(int syscall, int reason)
-{
-	struct siginfo info;
-	memset(&info, 0, sizeof(info));
-	info.si_signo = SIGSYS;
-	info.si_code = SYS_SECCOMP;
-	info.si_call_addr = (void __user *)KSTK_EIP(current);
-	info.si_errno = reason;
-	info.si_arch = syscall_get_arch(current, task_pt_regs(current));
-	info.si_syscall = syscall;
-	force_sig_info(SIGSYS, &info, current);
-}
 #endif	/* CONFIG_SECCOMP_FILTER */
 
 /*
@@ -393,7 +363,6 @@ int __secure_computing(int this_syscall)
 	int mode = current->seccomp.mode;
 	int exit_sig = 0;
 	int *syscall;
-	u32 ret;
 
 	switch (mode) {
 	case SECCOMP_MODE_STRICT:
@@ -407,54 +376,14 @@ int __secure_computing(int this_syscall)
 				return 0;
 		} while (*++syscall);
 		exit_sig = SIGKILL;
-		ret = SECCOMP_RET_KILL;
 		break;
 #ifdef CONFIG_SECCOMP_FILTER
-	case SECCOMP_MODE_FILTER: {
-		int data;
-		ret = seccomp_run_filters(this_syscall);
-		data = ret & SECCOMP_RET_DATA;
-		ret &= SECCOMP_RET_ACTION;
-		switch (ret) {
-		case SECCOMP_RET_ERRNO:
-			/* Set the low-order 16-bits as a errno. */
-			syscall_set_return_value(current, task_pt_regs(current),
-						 -data, 0);
-			goto skip;
-		case SECCOMP_RET_TRAP:
-			/* Show the handler the original registers. */
-			syscall_rollback(current, task_pt_regs(current));
-			/* Let the filter pass back 16 bits of data. */
-			seccomp_send_sigsys(this_syscall, data);
-			goto skip;
-		case SECCOMP_RET_TRACE:
-			/* Skip these calls if there is no tracer. */
-			if (!ptrace_event_enabled(current, PTRACE_EVENT_SECCOMP)) {
-				/* Make sure userspace sees an ENOSYS. */
-				syscall_set_return_value(current,
-					task_pt_regs(current), -ENOSYS, 0);
-				goto skip;
-			}
-			/* Allow the BPF to provide the event message */
-			ptrace_event(PTRACE_EVENT_SECCOMP, data);
-			/*
-			 * The delivery of a fatal signal during event
-			 * notification may silently skip tracer notification.
-			 * Terminating the task now avoids executing a system
-			 * call that may not be intended.
-			 */
-			if (fatal_signal_pending(current))
-				break;
-			return 0;
-		case SECCOMP_RET_ALLOW:
-			return 0;
-		case SECCOMP_RET_KILL:
-		default:
-			break;
-		}
+	case SECCOMP_MODE_FILTER:
+		if (seccomp_run_filters(this_syscall) == SECCOMP_RET_ALLOW)
+			return;
+		seccomp_filter_log_failure(this_syscall);
 		exit_sig = SIGSYS;
 		break;
-	}
 #endif
 	default:
 		BUG();
@@ -463,13 +392,8 @@ int __secure_computing(int this_syscall)
 #ifdef SECCOMP_DEBUG
 	dump_stack();
 #endif
-	audit_seccomp(this_syscall, exit_sig, ret);
+	audit_seccomp(this_syscall);
 	do_exit(exit_sig);
-#ifdef CONFIG_SECCOMP_FILTER
-skip:
-	audit_seccomp(this_syscall, exit_sig, ret);
-#endif
-	return -1;
 }
 
 long prctl_get_seccomp(void)
@@ -478,57 +402,47 @@ long prctl_get_seccomp(void)
 }
 
 /**
- * seccomp_set_mode_strict: internal function for setting strict seccomp
+ * prctl_set_seccomp: configures current->seccomp.mode
+ * @seccomp_mode: requested mode to use
+ * @filter: optional struct sock_fprog for use with SECCOMP_MODE_FILTER
+ *
+ * This function may be called repeatedly with a @seccomp_mode of
+ * SECCOMP_MODE_FILTER to install additional filters.  Every filter
+ * successfully installed will be evaluated (in reverse order) for each system
+ * call the task makes.
  *
  * Once current->seccomp.mode is non-zero, it may not be changed.
  *
  * Returns 0 on success or -EINVAL on failure.
  */
-static long seccomp_set_mode_strict(void)
+long prctl_set_seccomp(unsigned long seccomp_mode, char __user *filter)
 {
-	const unsigned long seccomp_mode = SECCOMP_MODE_STRICT;
 	long ret = -EINVAL;
 
-	if (!seccomp_may_assign_mode(seccomp_mode))
+	if (current->seccomp.mode &&
+	    current->seccomp.mode != seccomp_mode)
 		goto out;
 
+	switch (seccomp_mode) {
+	case SECCOMP_MODE_STRICT:
+		ret = 0;
 #ifdef TIF_NOTSC
 	disable_TSC();
 #endif
-	seccomp_assign_mode(seccomp_mode);
-	ret = 0;
-
-out:
-
-	return ret;
-}
-
+		break;
 #ifdef CONFIG_SECCOMP_FILTER
-/**
- * seccomp_set_mode_filter: internal function for setting seccomp filter
- * @filter: struct sock_fprog containing filter
- *
- * This function may be called repeatedly to install additional filters.
- * Every filter successfully installed will be evaluated (in reverse order)
- * for each system call the task makes.
- *
- * Once current->seccomp.mode is non-zero, it may not be changed.
- *
- * Returns 0 on success or -EINVAL on failure.
- */
-static long seccomp_set_mode_filter(char __user *filter)
-{
-	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
-	long ret = -EINVAL;
-
-	if (!seccomp_may_assign_mode(seccomp_mode))
+	case SECCOMP_MODE_FILTER:
+		ret = seccomp_attach_user_filter(filter);
+		if (ret)
+			goto out;
+		break;
+#endif
+	default:
 		goto out;
+	}
 
-	ret = seccomp_attach_user_filter(filter);
-	if (ret)
-		goto out;
-
-	seccomp_assign_mode(seccomp_mode);
+	current->seccomp.mode = seccomp_mode;
+	set_thread_flag(TIF_SECCOMP);
 out:
 	return ret;
 }

@@ -12,16 +12,13 @@
 
 /*
  * All BPF programs must return a 32-bit value.
- * The bottom 16-bits are for optional return data.
+ * The bottom 16-bits are reserved for future use.
  * The upper 16-bits are ordered from least permissive values to most.
  *
  * The ordering ensures that a min_t() over composed return values always
  * selects the least permissive choice.
  */
 #define SECCOMP_RET_KILL	0x00000000U /* kill the task immediately */
-#define SECCOMP_RET_TRAP	0x00030000U /* disallow and force a SIGSYS */
-#define SECCOMP_RET_ERRNO	0x00050000U /* returns an errno */
-#define SECCOMP_RET_TRACE	0x7ff00000U /* pass to a tracer or disallow */
 #define SECCOMP_RET_ALLOW	0x7fff0000U /* allow */
 
 /* Masks for the return value sections. */
@@ -50,8 +47,21 @@ struct seccomp_data {
 #include <linux/thread_info.h>
 #include <asm/seccomp.h>
 
+struct seccomp_filter;
+/**
+ * struct seccomp - the state of a seccomp'ed process
+ *
+ * @mode:  indicates one of the valid values above for controlled
+ *         system calls available to a process.
+ * @filter: The metadata and ruleset for determining what system calls
+ *          are allowed for a task.
+ *
+ *          @filter must only be accessed from the context of current as there
+ *          is no locking.
+ */
 struct seccomp {
 	int mode;
+	struct seccomp_filter *filter;
 };
 
 extern void __secure_computing(int);
@@ -75,6 +85,7 @@ static inline int seccomp_mode(struct seccomp *s)
 #include <linux/errno.h>
 
 struct seccomp { };
+struct seccomp_filter { };
 
 #define secure_computing(x) 0
 
