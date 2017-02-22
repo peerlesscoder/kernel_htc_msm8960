@@ -1245,9 +1245,9 @@ static int htc_batt_get_battery_info(struct battery_info_reply *htc_batt_update)
 	htc_batt_update->pj_src = htc_batt_info.rep.pj_src;
 	htc_batt_update->pj_chg_status = htc_batt_info.rep.pj_chg_status;
 	htc_batt_update->pj_full = htc_batt_info.rep.pj_full;
-	htc_batt_update->pj_level = htc_batt_info.rep.pj_level;
-	htc_batt_update->pj_level_pre = htc_batt_info.rep.pj_level_pre;
-	htc_batt_update->cc_uah = htc_batt_info.rep.cc_uah;
+	htc_batt_update->pj_level= htc_batt_info.rep.pj_level;
+	htc_batt_update->pj_level_pre= htc_batt_info.rep.pj_level_pre;
+	htc_batt_update->cc_uah= htc_batt_info.rep.cc_uah;
 	return 0;
 }
 
