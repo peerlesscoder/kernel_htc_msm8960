@@ -1119,7 +1119,7 @@ static int check_version(Elf_Shdr *sechdrs,
 		return 1;
 
 	if(!strncmp("texfat", mod->name, 6))
-		return 1;
+		return 1; //This change was done with the commit for moc-crypto modules but forgot to commit with it, so done it here
 
 	/* Exporting module didn't supply crcs?  OK, we're already tainted. */
 	if (!crc)
